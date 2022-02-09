@@ -1,4 +1,4 @@
-import sys, os.path
+import sys, time
 
 try:
     import requests
@@ -21,99 +21,74 @@ except ModuleNotFoundError:
     pip.main(['install', "json"]) 
     import json
 
+def p_red(text):
+    return("\033[31m"+text+"\033[0m")
+
+def p_yellow(text):
+    return("\033[33m"+text+"\033[0m")
+
+def p_green(text):
+    return("\033[32m"+text+"\033[0m")
+
 # Параметры подключения
 proxmox = ProxmoxAPI("xxx.xxx.xxx.xxx", user="root@pam", password="xxxxxxxxxxxxxx", verify_ssl=False)
 
 # Определение переменных
-work_mod = 'read'
-file ='startonboot.conf'
 nodes = []
-st_on_boot_conf = []
-
+storages = []
+storage = {}
+# Время по умолчанию 48ч
+h = 172800 
 # Проверка входных аргументов
-if len(sys.argv) > 1:
-    if sys.argv[1] == "-export":
-        work_mod = 'export'
-    elif sys.argv[1] == "-disable":
-        work_mod = 'disable'
-    elif sys.argv[1] == "-import":
-        if len(sys.argv) < 3:
-            sys.exit("Use -import <file.conf>")
-        else:
-          work_mod = 'import'
-
-if len(sys.argv) == 3:
-    file = str(sys.argv[2])
-
-# Функция записи конфигурации в файл
-def to_file(config, file):
-  json_start_conf = json.dumps(config)
-  with open(file,'w') as out:
-    out.write(json_start_conf)
-  out.close()
-
-# Функция чтения из файла
-def from_file(file):
-  with open(file,'r') as conf_file:
-    data = json.load(conf_file)
-  conf_file.close()
-  # Приведение типа VM id к int
-  for i in range(len(data)):
-      result = {}
-      for k, v in data[i]['vm'].items():
-          result[int(k)] = v
-      data[i]['vm'] = result
-  #--------------------------   
-  return(data)
-
-# Проверяем наличие файла
-if (os.path.exists(file) == True) and ((work_mod == 'export') or (work_mod == 'disable')):
-    sys.exit("\033[31m{0} \033[33m{1} \033[31m{2} \033[0m" .format('!!!!!!!! Error: File', file, 'is exist. Specify another file.'))
-elif (os.path.exists(file) == False) and (work_mod == 'import'):
-    sys.exit("\033[31m{0} \033[33m{1} \033[31m{2} \033[0m" .format('!!!!!!!! Error: File', file, 'is not exist. Specify an existing file.'))
+if len(sys.argv) > 2:
+    if (sys.argv[1] == "-t"):
+        try:
+            h = 3600 * int(sys.argv[2])
+        except ValueError:
+            sys.exit('Use proxmox-backup-check.py -t <difference in hours>')
 
 # Получаем список нод
 for node in proxmox.nodes.get():
     nodes.append(node['node'])
 
-# Опрос о автостарте VM на нодах и отключение, если запрошено
+# Получаем список стораджей
+storages = proxmox.storage.get()
+
+# Оставляем сторадж с type = pbs
+for stor in storages:
+    if stor['type'] == 'pbs':
+        storage = stor
+
+# Запрашиваем список бекапов
+backups = proxmox.nodes(nodes[0]).storage(storage['storage']).content.get()
+
+# Отсеиваем лишнее
+backups_short = []
+for i in range(len(backups)):
+    if (time.time() - backups[i]['ctime']) < h:
+        backups_short.append(backups[i])
+
+
+# Проверка актуальности бекапов:
+vms_status =[]
 for node in nodes:
-    start_conf = {}
-    print("\033[33m{}\033[0m".format(node + ' current state:'))
+    bad_vm = []
+    good_vm =[]
+    #print("\033[33m{}\033[0m".format(node + ':'))
     for vm in proxmox.nodes(node).qemu.get():
-        config = proxmox.nodes(node).qemu(vm['vmid']).config.get()
-        if ('onboot' in config) and (config['onboot'] == 1):
-          print ("{0} | {1} | Start at boot = \033[32m{2} \033[0m" .format(vm['vmid'], vm['name'], config['onboot']))
-          start_conf[vm['vmid']] = config['onboot']
-          if work_mod == 'disable':
-              print (" \033[31m{0} | {1} | Start at boot \033[32m{2} \033[31m{3} \033[0m" .format(vm['vmid'], vm['name'], config['onboot'], '=> 0'))
-              proxmox.nodes(node).qemu(vm['vmid']).config.put(onboot=0)
+        if vm['vmid'] not in bad_vm:
+            bad_vm.append(vm['vmid'])
+        for backup in backups_short:
+            if backup['vmid'] == vm['vmid']:
+                bad_vm.remove(vm['vmid'])
+                good_vm.append(vm['vmid'])
+                break
+    vms_status.append({'name': node, 'bad_vm': bad_vm, 'good_vm': good_vm})
 
-        else:
-          config['onboot'] = 0
-          print ("{0} | {1} | Start at boot = \033[31m{2} \033[0m" .format(vm['vmid'], vm['name'], config['onboot']))
-          start_conf[vm['vmid']] = config['onboot']
-    st_on_boot_conf.append({'name':node, 'vm':start_conf})
-
-# Записываем в файл
-if work_mod == 'export' or work_mod == 'disable':
-  to_file(st_on_boot_conf, file)
-
-# Применение параметров из файла
-if work_mod == 'import':
-    new_start_conf = from_file(file)
-    print(new_start_conf)
-    # Проверка наличия нод из файла в кластере
-    for i in range(len(nodes)):
-        if new_start_conf[i]['name'] not in nodes:
-            sys.exit("\033[31m{0} \033[33m{1} \033[31m{2} \033[0m" .format('!!!!!!!! Error: No node', new_start_conf[i]['name'], 'in file!!!!!!!!!'))
-    # Прменяем на кластере
-    for node in new_start_conf:
-        print("\033[33m{0} \033[31m{1}\033[0m".format(node['name'], 'changing autostart state:'))
-        for vm in proxmox.nodes(node['name']).qemu.get():
-            # Проверка наличия VM id в файле
-            if vm['vmid'] not in node['vm']:
-                sys.exit("\033[31m{0} \033[33m{1} \033[31m{2} \033[33m{3} \033[0m" .format('!!!!!!!! Error: No VM id', vm['vmid'], 'from file on node', node['name']))    
-            print("VM \033[32m{0}\033[0m to \033[31m{1} \033[0m" .format(str(vm['vmid']), str(node['vm'][vm['vmid']])))
-            proxmox.nodes(node['name']).qemu(vm['vmid']).config.put(onboot=node['vm'][vm['vmid']])
-
+# Вывод результатов
+for mv_status in vms_status:
+    print(p_yellow(mv_status['name']+':'))
+    for vmid in mv_status['good_vm']:
+        print(str(vmid) + ' | ' + p_green('backup OK'))
+    for vmid in mv_status['bad_vm']:
+        print(p_red(str(vmid)) + ' | ' + p_red('NO backup'))
